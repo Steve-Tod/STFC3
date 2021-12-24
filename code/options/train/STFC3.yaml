@@ -1,0 +1,70 @@
+name: CRWFCNV0_Kinetics
+use_tb_logger: true
+type: CRWFCNV1
+gpu_id: [0, 1, 2, 3, 4, 5, 6, 7]
+debug: False
+no_check: True
+
+dataset:
+  train:
+    name: Kinetics Train
+    mode: KineticsTVDataset
+    root: /path/to/train/data
+    metadata: /path/to/train/metadata
+    seq_len: 4
+    size: 256
+    frame_rate: 8
+    clips_per_video: 5
+    phase: train
+    frame_transforms: crop
+    frame_aug: ''
+    color_aug: 'BYOL'
+
+    aug_scale: [0.08, 1.0]
+    aug_ratio: [0.7, 1.3]
+    h_flip: 0.5
+    same_on_batch: True
+    feature_size: 32
+    affine_th: 0.5
+    dist_type: 1
+    rad: 0.1
+
+    num_workers: 8
+    batch_size: 24
+
+model:
+  model_type: CRWFCNV0
+  pretrained_res: False
+  res_model: r18
+  dropout: 0.1
+  temperature: 0.05
+
+  proj_option:
+    bn: true
+    dim: [2048, 512]
+    remove_last_bias: True
+  sync_bn: True
+
+train:
+  learning_rate: 0.0001
+  loss:
+    cycle:
+      weight: 1
+      loss_type: LogNLLMaskNeighbour
+      aggregation: sum
+  optimizer: Adam
+  lr_gamma: 0.3
+  lr_scheme: MultiStepLR
+  lr_steps: [20]
+  num_epoch: 25
+  val_metric: loss_cycle
+  weight_decay: 0
+  manual_seed: 1234
+  save_freq: 1
+  save_freq_step: 8000
+
+logger:
+  print_freq: 500
+
+path:
+  root: /placeholder
