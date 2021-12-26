@@ -1,103 +1,208 @@
+from __future__ import print_function
+
 import os
-import math
-import argparse
-import random
-import logging
+import time
+import imageio
 import numpy as np
-from PIL import Image
-from collections import OrderedDict
-import matplotlib.pyplot as plt
 
 import torch
+import torch.nn as nn
+import torch.backends.cudnn as cudnn
 
-from options.parse import parse, dict2str, save_opt
-from utils import util_dir, util_log, util_misc, util_dist, util_test
-from data import create_sampler, create_dataloader, create_dataset
-from solvers import create_solver
+from model import CRW
 
+from data import vos, jhmdb
+from data.video import SingleVideoDataset
+from collections import OrderedDict
+import utils_test
+import utils_test.test_utils as test_utils
+import res_encoder
 
-def main():
-    #### options
-    parser = argparse.ArgumentParser()
-    parser.add_argument('-opt', type=str, help='Path to option yaml file.')
-    parser.add_argument("--local_rank", type=int, default=-1)
-    args = parser.parse_args()
-    opt = parse(args.opt, is_train=False)
-    if args.local_rank >= 0:
-        opt['distributed'] = True
-        opt['rank'] = args.local_rank
-    else:
-        opt['distributed'] = False
-        opt['rank'] = 0
-    rank0 = opt['rank'] == 0
-    assert rank0, 'Only single process testing is supported!'
+def main(args, vis):
+    model = CRW(args, vis=vis).to(args.device)
+    #model = res_encoder.resnet18(pretrained=False, uselayer = 3)   
+    args.mapScale = test_utils.infer_downscale(model)
 
-    #### mkdir and loggers
-    if rank0:
-        util_dir.mkdir_and_rename(
-            opt['path']['result_root'], opt['time_stamp'], opt['no_check'])  # rename experiment folder if exists
-        util_dir.mkdirs((path for key, path in opt['path'].items() if not key == 'experiment_root'
-                         and 'pretrained_model' not in key 
-                         and 'resume' not in key))
-    # config loggers. Before it, the log will not work
-    if opt['debug']:
-        log_level = logging.DEBUG
-    else:
-        log_level = logging.INFO
-    util_log.setup_logger('base', opt['path']['log'], 'train_' + opt['name'], level=log_level,
-                      screen=True, tofile=rank0)
-    logger = logging.getLogger('base')
-    if rank0:
-        logger.info(dict2str(opt))
+    args.use_lab = args.model_type == 'uvc'
+    dataset = (vos.VOSDataset if not 'jhmdb' in args.filelist  else jhmdb.JhmdbSet)(args)
+    val_loader = torch.utils.data.DataLoader(dataset,
+        batch_size=int(args.batchSize), shuffle=False, num_workers=args.workers, pin_memory=True)
 
-    # dist init
-    if opt['distributed']:
-        util_dist.dist_init(args.local_rank)
-    util_dist.dist_barrier(opt)
+    # cudnn.benchmark = False
+    print('Total params: %.2fM' % (sum(p.numel() for p in model.parameters())/1000000.0))
 
-    #### create train and val dataloader
-    for phase, dataset_opt in opt['dataset'].items():
-        if phase == 'test':
-            test_set = create_dataset(dataset_opt, opt)
-            test_sampler = create_sampler(test_set, opt, shuffle=True)
-            test_loader = create_dataloader(test_set, dataset_opt, test_sampler)
-            test_size = len(test_loader)
-            if rank0:
-                logger.info('Number of test samples: %d' % (len(test_set)))
-        else:
-            raise NotImplementedError('Phase [{:s}] is not recognized.'.format(phase))
-    assert test_loader is not None
-
-    #### create solver
-    solver = create_solver(opt)
-    
-    #### testing
-    with torch.no_grad():
-        for _, data in enumerate(test_loader):
-            #### training
-            frame, seg, ori_size, frame_name_list, video_name, seg_ori_path = data
-            logger.info('Testing %s' % video_name[0])
-            seg = seg[0][0].to(solver.device)
-            # T*C*H*W
-            solver.feed_data(frame.squeeze(0).cuda(), inference=True)
-            feature = solver.inference()
-            segs = solver.video_segmentation(feature, seg)
-            save_dir = os.path.join(opt['path']['result_root'], 'seg', video_name[0])
-            os.makedirs(save_dir, exist_ok=True)
-            os.system('cp %s %s' % (seg_ori_path[0], os.path.join(save_dir, frame_name_list[0][0]  + '.png')))
-            for i, s in enumerate(segs):
-                s = torch.nn.functional.interpolate(s.unsqueeze(0),
-                                        scale_factor=test_set.scale,
-                                        mode='bilinear',
-                                        align_corners=False)
-                s = util_test.norm_mask(s[0])
-                _, seg_map = torch.max(s, dim=0)
-                seg_map = seg_map.cpu().numpy().astype(np.uint8)
-                img = Image.fromarray(seg_map).resize(ori_size, Image.NEAREST)
-                save_path = os.path.join(save_dir, frame_name_list[i + 1][0]  + '.png')
-                util_test.imwrite_indexed(save_path, np.array(img))
+    # Load checkpoint.
+    if os.path.isfile(args.resume):
+        print('==> Resuming from checkpoint ' + args.resume)
+        checkpoint = torch.load(args.resume)
         
-    util_dist.dist_destroy(opt)
+
+        new_sd = OrderedDict()
+        for k, v in checkpoint.items():
+            if 'backbone' in k:
+                 new_k = '.'.join(k.split('.')[2:])
+                 new_k = 'encoder.model.' + new_k
+                 new_sd[new_k] = v
+    #      state_dict_new['.'.join(k.split('.')[1:])] = v
+        model.load_state_dict(new_sd, strict = True)
+
     
+    model.eval()
+    model = model.to(args.device)
+
+    if not os.path.exists(args.save_path):
+        os.makedirs(args.save_path)
+    
+    with torch.no_grad():
+        test_loss = test(val_loader, model, args)
+            
+
+def test(loader, model, args):
+    n_context = args.videoLen
+    D = None    # Radius mask
+    
+    for vid_idx, (imgs, imgs_orig, lbls, lbls_orig, lbl_map, meta) in enumerate(loader):
+        t_vid = time.time()
+        imgs = imgs.to(args.device)
+        B, N = imgs.shape[:2]
+        assert(B == 1)
+
+        print('******* Vid %s (%s frames) *******' % (vid_idx, N))
+        with torch.no_grad():
+            t00 = time.time()
+
+            ##################################################################
+            # Compute image features (batched for memory efficiency)
+            ##################################################################
+            bsize = 5   # minibatch size for computing features
+            feats = []
+            for b in range(0, imgs.shape[1], bsize):
+                feat = model.encoder(imgs[:, b:b+bsize].transpose(1,2).to(args.device))
+                feats.append(feat.cpu())
+            feats = torch.cat(feats, dim=2).squeeze(1)
+
+            if not args.no_l2:
+                feats = torch.nn.functional.normalize(feats, dim=1)
+
+            print('computed features', time.time()-t00)
+
+            if args.pca_vis and vis:
+                pca_feats = [utils.visualize.pca_feats(feats[0].transpose(0, 1), K=1)]
+                for pf in pca_feats:
+                    pf = torch.nn.functional.interpolate(pf[::10], scale_factor=(4, 4), mode='bilinear')
+                    vis.images(pf, nrow=2, env='main_pca')
+                    import pdb; pdb.set_trace()
+
+            ##################################################################
+            # Compute affinities
+            ##################################################################
+            torch.cuda.empty_cache()
+            t03 = time.time()
+            
+            # Prepare source (keys) and target (query) frame features
+            key_indices = test_utils.context_index_bank(n_context, args.long_mem, N - n_context)
+            key_indices = torch.cat(key_indices, dim=-1)           
+            keys, query = feats[:, :, key_indices], feats[:, :, n_context:]
+
+            # Make spatial radius mask TODO use torch.sparse
+            restrict = utils_test.MaskedAttention(args.radius, flat=False)
+            D = restrict.mask(*feats.shape[-2:])[None]
+            D = D.flatten(-4, -3).flatten(-2)
+            D[D==0] = -1e10; D[D==1] = 0
+
+            # Flatten source frame features to make context feature set
+            keys, query = keys.flatten(-2), query.flatten(-2)
+
+            print('computing affinity')
+            Ws, Is = test_utils.mem_efficient_batched_affinity(query, keys, D, 
+                        args.temperature, args.topk, args.long_mem, args.device)
+            # Ws, Is = test_utils.batched_affinity(query, keys, D, 
+            #             args.temperature, args.topk, args.long_mem, args.device)
+
+            if torch.cuda.is_available():
+                print(time.time()-t03, 'affinity forward, max mem', torch.cuda.max_memory_allocated() / (1024**2))
+
+            ##################################################################
+            # Propagate Labels and Save Predictions
+            ###################################################################
+
+            maps, keypts = [], []
+            lbls[0, n_context:] *= 0 
+            lbl_map, lbls = lbl_map[0], lbls[0]
+
+            for t in range(key_indices.shape[0]):
+                # Soft labels of source nodes
+                ctx_lbls = lbls[key_indices[t]].to(args.device)
+                ctx_lbls = ctx_lbls.flatten(0, 2).transpose(0, 1)
+
+                # Weighted sum of top-k neighbours (Is is index, Ws is weight) 
+                pred = (ctx_lbls[:, Is[t]] * Ws[t].to(args.device)[None]).sum(1)
+                pred = pred.view(-1, *feats.shape[-2:])
+                pred = pred.permute(1,2,0)
+                
+                if t > 0:
+                    lbls[t + n_context] = pred
+                else:
+                    pred = lbls[0]
+                    lbls[t + n_context] = pred
+
+                if args.norm_mask:
+                    pred[:, :, :] -= pred.min(-1)[0][:, :, None]
+                    pred[:, :, :] /= pred.max(-1)[0][:, :, None]
+
+                # Save Predictions            
+                cur_img = imgs_orig[0, t + n_context].permute(1,2,0).numpy() * 255
+                _maps = []
+
+                if 'jhmdb' in args.filelist.lower():
+                    coords, pred_sharp = test_utils.process_pose(pred, lbl_map)
+                    keypts.append(coords)
+                    pose_map = utils.vis_pose(np.array(cur_img).copy(), coords.numpy() * args.mapScale[..., None])
+                    _maps += [pose_map]
+
+                if 'VIP' in args.filelist:
+                    outpath = os.path.join(args.save_path, 'videos'+meta['img_paths'][t+n_context][0].split('videos')[-1])
+                    os.makedirs(os.path.dirname(outpath), exist_ok=True)
+                else:
+                    outpath = os.path.join(args.save_path, str(vid_idx) + '_' + str(t))
+
+                heatmap, lblmap, heatmap_prob = test_utils.dump_predictions(
+                    pred.cpu().numpy(),
+                    lbl_map, cur_img, outpath)
+
+                _maps += [heatmap, lblmap, heatmap_prob]
+                maps.append(_maps)
+
+                if args.visdom:
+                    [vis.image(np.uint8(_m).transpose(2, 0, 1)) for _m in _maps]
+
+            if len(keypts) > 0:
+                coordpath = os.path.join(args.save_path, str(vid_idx) + '.dat')
+                np.stack(keypts, axis=-1).dump(coordpath)
+            
+            if vis:
+                wandb.log({'blend vid%s' % vid_idx: wandb.Video(
+                    np.array([m[0] for m in maps]).transpose(0, -1, 1, 2), fps=12, format="gif")})  
+                wandb.log({'plain vid%s' % vid_idx: wandb.Video(
+                    imgs_orig[0, n_context:].numpy(), fps=4, format="gif")})  
+                
+            torch.cuda.empty_cache()
+            print('******* Vid %s TOOK %s *******' % (vid_idx, time.time() - t_vid))
+
+
 if __name__ == '__main__':
-    main()
+    args = utils_test.arguments.test_args()
+
+    args.imgSize = args.cropSize
+    print('Context Length:', args.videoLen, 'Image Size:', args.imgSize)
+    print('Arguments', args)
+
+    vis = None
+    if args.visdom:
+        import visdom
+        import wandb
+        vis = visdom.Visdom(server=args.visdom_server, port=8095, env='main_davis_viz1'); vis.close()
+        wandb.init(project='palindromes', group='test_online')
+        vis.close()
+
+    main(args, vis)
