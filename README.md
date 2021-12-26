@@ -1,6 +1,6 @@
 # Breaking Shortcut: Exploring Fully Convolutional Cycle-Consistency for Video Correspondence Learning
 
-[Yansong Tang](https://andytang15.github.io/) \*, [Zhenyu Jiang](http://zhenyujiang.me) \*, [Zhenda Xie](https://zdaxie.github.io/), [Yue Cao](http://yue-cao.me/), [Zheng Zhang](https://stupidzz.github.io/), [Philip H. S. Torr](https://www.robots.ox.ac.uk/~phst/), [Han Hu](https://ancientmooner.github.io/)
+[Yansong Tang](https://andytang15.github.io/) \*, [Zhenyu Jiang](http://zhenyujiang.me) \*, [Zhenda Xie](https://zdaxie.github.io/) \*, [Yue Cao](http://yue-cao.me/), [Zheng Zhang](https://stupidzz.github.io/), [Philip H. S. Torr](https://www.robots.ox.ac.uk/~phst/), [Han Hu](https://ancientmooner.github.io/) (* equal contribution)
 
 [arxiv](https://arxiv.org/pdf/2105.05838.pdf) 
 
