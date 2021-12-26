@@ -55,7 +55,7 @@ We follow the [CRW](https://github.com/ajabri/videowalk) to perform downstream t
 An example command is:
 
 ```bash
-bash davis_test_script.sh ~/proj_2048_512.pth reproduce 0 -1
+bash davis_test_script.sh $TRAINED_MODEL_PATH reproduce 0 -1
 ```
 
 ## Related Repositories
