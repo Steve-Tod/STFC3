@@ -49,8 +49,11 @@ An example option file is [here](code/options/train/STFC3.yaml)
 
 ### Testing
 You could download our pretrained model [here](https://drive.google.com/file/d/14QOKJZcB8GdA6W2oV0nysbBevYWebLJs/view?usp=sharing)
+
 We follow the [CRW](https://github.com/ajabri/videowalk) to perform downstream task evaluation
+
 An example command is:
+
 ```bash
 bash davis_test_script.sh ~/proj_2048_512.pth reproduce 0 -1
 ```
